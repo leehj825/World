@@ -15,6 +15,7 @@
     "@types/express": "^5.0.6",
     "colyseus": "^0.18.8",
     "express": "^5.2.1",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.52.0"
   }
 }
