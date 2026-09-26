@@ -1,4 +1,3 @@
-import './style.css'
 import { Client } from '@colyseus/sdk'
 import type { GameState, Player } from 'shared'
 import {
@@ -10,49 +9,15 @@ import {
   isValidChunk,
   worldToChunk,
   type AttackMessage,
+  type ChatInput,
+  type ChatMessage,
   type CombatEvent,
   type MapChunk,
 } from 'shared'
+import { SERVER_HTTP_URL } from './api.js'
+import { emitChatMessage, emitGameStateChange, onIntent } from './EventBus.js'
 
-const SERVER_HTTP_URL = 'http://localhost:2567'
 const SERVER_WS_URL = 'ws://localhost:2567'
-
-const app = document.querySelector<HTMLDivElement>('#app')!
-
-const canvas = document.createElement('canvas')
-canvas.width = 800
-canvas.height = 600
-app.appendChild(canvas)
-
-const ctx = canvas.getContext('2d')!
-
-const authOverlay = document.createElement('div')
-authOverlay.className = 'auth-overlay'
-authOverlay.innerHTML = `
-  <form class="auth-form">
-    <h1>Vanguard RPG</h1>
-    <label>
-      Username
-      <input type="text" name="username" autocomplete="username" required />
-    </label>
-    <label>
-      Password
-      <input type="password" name="password" autocomplete="current-password" required />
-    </label>
-    <div class="auth-actions">
-      <button type="submit" data-action="login">Login</button>
-      <button type="button" data-action="register">Register</button>
-    </div>
-    <p class="auth-error"></p>
-  </form>
-`
-app.appendChild(authOverlay)
-
-const authForm = authOverlay.querySelector('form')!
-const usernameInput = authForm.querySelector<HTMLInputElement>('input[name="username"]')!
-const passwordInput = authForm.querySelector<HTMLInputElement>('input[name="password"]')!
-const registerButton = authForm.querySelector<HTMLButtonElement>('[data-action="register"]')!
-const errorMessage = authForm.querySelector<HTMLParagraphElement>('.auth-error')!
 
 const PLAYER_SIZE = 16
 const MOVE_STEP = 4
@@ -150,8 +115,6 @@ class ChunkManager {
   }
 }
 
-const chunkManager = new ChunkManager()
-
 /** Hit-reaction state driven by transient `combat_event` messages, kept
  * separate from authoritative state so it can animate independently of the
  * server's patch rate. */
@@ -163,107 +126,106 @@ interface FloatingDamage {
   startedAt: number
 }
 
-const flashUntil = new Map<string, number>()
-let floatingDamages: FloatingDamage[] = []
+/**
+ * Bootstraps the Colyseus connection and starts rendering the game to the
+ * given canvas. This is the game engine's only public entry point — it owns
+ * no DOM beyond the canvas it's handed, so it can be mounted by anything
+ * (a bare HTML page, a React component, whatever).
+ */
+export async function initGame(canvas: HTMLCanvasElement, token: string): Promise<void> {
+  const ctx = canvas.getContext('2d')!
+  const chunkManager = new ChunkManager()
+  const flashUntil = new Map<string, number>()
+  let floatingDamages: FloatingDamage[] = []
 
-function drawTerrain(cameraX: number, cameraY: number) {
-  for (const chunk of chunkManager.loadedChunks()) {
-    const chunkOriginX = chunk.chunkX * CHUNK_SIZE_PX
-    const chunkOriginY = chunk.chunkY * CHUNK_SIZE_PX
+  function resizeCanvas() {
+    canvas.width = canvas.clientWidth
+    canvas.height = canvas.clientHeight
+  }
+  resizeCanvas()
+  window.addEventListener('resize', resizeCanvas)
 
-    for (let localY = 0; localY < CHUNK_TILES; localY++) {
-      const row = chunk.tiles[localY]
-      for (let localX = 0; localX < CHUNK_TILES; localX++) {
-        const screenX = chunkOriginX + localX * TILE_SIZE - cameraX
-        const screenY = chunkOriginY + localY * TILE_SIZE - cameraY
+  function drawTerrain(cameraX: number, cameraY: number) {
+    for (const chunk of chunkManager.loadedChunks()) {
+      const chunkOriginX = chunk.chunkX * CHUNK_SIZE_PX
+      const chunkOriginY = chunk.chunkY * CHUNK_SIZE_PX
 
-        if (screenX + TILE_SIZE < 0 || screenX > canvas.width) continue
-        if (screenY + TILE_SIZE < 0 || screenY > canvas.height) continue
+      for (let localY = 0; localY < CHUNK_TILES; localY++) {
+        const row = chunk.tiles[localY]
+        for (let localX = 0; localX < CHUNK_TILES; localX++) {
+          const screenX = chunkOriginX + localX * TILE_SIZE - cameraX
+          const screenY = chunkOriginY + localY * TILE_SIZE - cameraY
 
-        ctx.fillStyle = TILE_COLORS[row[localX]]
-        ctx.fillRect(screenX, screenY, TILE_SIZE, TILE_SIZE)
+          if (screenX + TILE_SIZE < 0 || screenX > canvas.width) continue
+          if (screenY + TILE_SIZE < 0 || screenY > canvas.height) continue
+
+          ctx.fillStyle = TILE_COLORS[row[localX]]
+          ctx.fillRect(screenX, screenY, TILE_SIZE, TILE_SIZE)
+        }
       }
     }
   }
-}
 
-function drawHealthBar(screenX: number, screenY: number, player: Player) {
-  const barX = screenX - HEALTH_BAR_WIDTH / 2
-  const barY = screenY - HEALTH_BAR_OFFSET_Y
-  const ratio = player.maxHp > 0 ? Math.max(0, Math.min(1, player.hp / player.maxHp)) : 0
+  function drawHealthBar(screenX: number, screenY: number, player: Player) {
+    const barX = screenX - HEALTH_BAR_WIDTH / 2
+    const barY = screenY - HEALTH_BAR_OFFSET_Y
+    const ratio = player.maxHp > 0 ? Math.max(0, Math.min(1, player.hp / player.maxHp)) : 0
 
-  ctx.fillStyle = '#3a1010'
-  ctx.fillRect(barX, barY, HEALTH_BAR_WIDTH, HEALTH_BAR_HEIGHT)
-  ctx.fillStyle = '#2ecc40'
-  ctx.fillRect(barX, barY, HEALTH_BAR_WIDTH * ratio, HEALTH_BAR_HEIGHT)
-}
-
-function drawFloatingDamage(now: number, cameraX: number, cameraY: number) {
-  floatingDamages = floatingDamages.filter((entry) => now - entry.startedAt < DAMAGE_NUMBER_LIFETIME_MS)
-
-  for (const entry of floatingDamages) {
-    const elapsed = now - entry.startedAt
-    const progress = elapsed / DAMAGE_NUMBER_LIFETIME_MS
-
-    const screenX = entry.x - cameraX
-    const screenY = entry.y - cameraY - PLAYER_SIZE / 2 - progress * DAMAGE_NUMBER_RISE_PX
-
-    ctx.globalAlpha = 1 - progress
-    ctx.fillStyle = '#ff4d4d'
-    ctx.font = 'bold 14px system-ui, sans-serif'
-    ctx.textAlign = 'center'
-    ctx.fillText(`-${entry.damage}`, screenX, screenY)
-    ctx.globalAlpha = 1
-  }
-}
-
-function draw(state: GameState, sessionId: string) {
-  const now = performance.now()
-  const localPlayer = state.players.get(sessionId)
-  const cameraX = (localPlayer?.x ?? 0) - canvas.width / 2
-  const cameraY = (localPlayer?.y ?? 0) - canvas.height / 2
-
-  ctx.clearRect(0, 0, canvas.width, canvas.height)
-  drawTerrain(cameraX, cameraY)
-
-  state.players.forEach((player, id) => {
-    const screenX = player.x - cameraX
-    const screenY = player.y - cameraY
-
-    const isFlashing = (flashUntil.get(id) ?? 0) > now
-    ctx.fillStyle = isFlashing ? '#ff3b3b' : id === sessionId ? '#aa3bff' : '#f3f4f6'
-    ctx.fillRect(screenX - PLAYER_SIZE / 2, screenY - PLAYER_SIZE / 2, PLAYER_SIZE, PLAYER_SIZE)
-
-    drawHealthBar(screenX, screenY, player)
-  })
-
-  drawFloatingDamage(now, cameraX, cameraY)
-
-  if (localPlayer) {
-    chunkManager.update(localPlayer.x, localPlayer.y)
-  }
-}
-
-async function callAuthEndpoint(path: '/auth/login' | '/auth/register', username: string, password: string) {
-  const response = await fetch(`${SERVER_HTTP_URL}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
-  })
-
-  const body = await response.json()
-  if (!response.ok) {
-    throw new Error(body.error ?? 'request failed')
+    ctx.fillStyle = '#3a1010'
+    ctx.fillRect(barX, barY, HEALTH_BAR_WIDTH, HEALTH_BAR_HEIGHT)
+    ctx.fillStyle = '#2ecc40'
+    ctx.fillRect(barX, barY, HEALTH_BAR_WIDTH * ratio, HEALTH_BAR_HEIGHT)
   }
 
-  return body
-}
+  function drawFloatingDamage(now: number, cameraX: number, cameraY: number) {
+    floatingDamages = floatingDamages.filter((entry) => now - entry.startedAt < DAMAGE_NUMBER_LIFETIME_MS)
 
-async function connectToGameRoom(token: string) {
+    for (const entry of floatingDamages) {
+      const elapsed = now - entry.startedAt
+      const progress = elapsed / DAMAGE_NUMBER_LIFETIME_MS
+
+      const screenX = entry.x - cameraX
+      const screenY = entry.y - cameraY - PLAYER_SIZE / 2 - progress * DAMAGE_NUMBER_RISE_PX
+
+      ctx.globalAlpha = 1 - progress
+      ctx.fillStyle = '#ff4d4d'
+      ctx.font = 'bold 14px system-ui, sans-serif'
+      ctx.textAlign = 'center'
+      ctx.fillText(`-${entry.damage}`, screenX, screenY)
+      ctx.globalAlpha = 1
+    }
+  }
+
+  function draw(state: GameState, sessionId: string) {
+    const now = performance.now()
+    const localPlayer = state.players.get(sessionId)
+    const cameraX = (localPlayer?.x ?? 0) - canvas.width / 2
+    const cameraY = (localPlayer?.y ?? 0) - canvas.height / 2
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+    drawTerrain(cameraX, cameraY)
+
+    state.players.forEach((player, id) => {
+      const screenX = player.x - cameraX
+      const screenY = player.y - cameraY
+
+      const isFlashing = (flashUntil.get(id) ?? 0) > now
+      ctx.fillStyle = isFlashing ? '#ff3b3b' : id === sessionId ? '#aa3bff' : '#f3f4f6'
+      ctx.fillRect(screenX - PLAYER_SIZE / 2, screenY - PLAYER_SIZE / 2, PLAYER_SIZE, PLAYER_SIZE)
+
+      drawHealthBar(screenX, screenY, player)
+    })
+
+    drawFloatingDamage(now, cameraX, cameraY)
+
+    if (localPlayer) {
+      chunkManager.update(localPlayer.x, localPlayer.y)
+      emitGameStateChange({ hp: localPlayer.hp, maxHp: localPlayer.maxHp, playerCount: state.players.size })
+    }
+  }
+
   const client = new Client(SERVER_WS_URL)
   const room = await client.joinOrCreate<GameState>('game_room', { token })
-
-  authOverlay.remove()
 
   let latestState: GameState | null = null
   room.onStateChange((state) => {
@@ -290,6 +252,16 @@ async function connectToGameRoom(token: string) {
       y: target?.y ?? 0,
       startedAt: now,
     })
+  })
+
+  room.onMessage<ChatMessage>('chat_message', (message) => {
+    emitChatMessage(message)
+  })
+
+  onIntent((intent) => {
+    if (intent.type === 'chat') {
+      room.send('chat_message', { text: intent.text } satisfies ChatInput)
+    }
   })
 
   window.addEventListener('keydown', (event) => {
@@ -320,30 +292,3 @@ async function connectToGameRoom(token: string) {
     })
   })
 }
-
-async function handleAuth(path: '/auth/login' | '/auth/register') {
-  errorMessage.textContent = ''
-
-  const username = usernameInput.value.trim()
-  const password = passwordInput.value
-
-  try {
-    if (path === '/auth/register') {
-      await callAuthEndpoint('/auth/register', username, password)
-    }
-
-    const { token } = await callAuthEndpoint('/auth/login', username, password)
-    await connectToGameRoom(token)
-  } catch (error) {
-    errorMessage.textContent = error instanceof Error ? error.message : 'something went wrong'
-  }
-}
-
-authForm.addEventListener('submit', (event) => {
-  event.preventDefault()
-  handleAuth('/auth/login')
-})
-
-registerButton.addEventListener('click', () => {
-  handleAuth('/auth/register')
-})

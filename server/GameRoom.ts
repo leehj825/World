@@ -3,7 +3,7 @@ import type { Client } from 'colyseus';
 import { StateView } from '@colyseus/schema';
 import jwt from 'jsonwebtoken';
 import { prisma } from 'database';
-import { AttackMessage, CombatEvent, GameState, Player, worldToChunk } from 'shared';
+import { AttackMessage, ChatInput, ChatMessage, CombatEvent, GameState, Player, worldToChunk } from 'shared';
 import { StateSyncService } from './StateSyncService.js';
 
 const jwtSecretEnv = process.env.JWT_SECRET;
@@ -13,6 +13,7 @@ if (!jwtSecretEnv) {
 const JWT_SECRET: string = jwtSecretEnv;
 
 const MELEE_RANGE = 48;
+const CHAT_MAX_LENGTH = 500;
 
 interface MoveMessage {
   x: number;
@@ -37,6 +38,7 @@ type GameClient = Client<{ auth: AuthResult }>;
 export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
   private readonly stateSync = new StateSyncService();
   private readonly characterIds = new Map<string, string>();
+  private readonly characterNames = new Map<string, string>();
   private readonly attackPowers = new Map<string, number>();
   private readonly playerChunks = new Map<string, ChunkCoords>();
 
@@ -57,6 +59,16 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
 
     this.onMessage<AttackMessage>('attack', (client, message) => {
       this.handleAttack(client, message);
+    });
+
+    this.onMessage<ChatInput>('chat_message', (client, message) => {
+      if (typeof message?.text !== 'string') return;
+
+      const text = message.text.trim().slice(0, CHAT_MAX_LENGTH);
+      if (!text) return;
+
+      const sender = this.characterNames.get(client.sessionId) ?? 'Unknown';
+      this.broadcast('chat_message', { sender, text } satisfies ChatMessage);
     });
   }
 
@@ -89,6 +101,7 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
     }
 
     this.characterIds.set(client.sessionId, character.id);
+    this.characterNames.set(client.sessionId, character.name);
     this.attackPowers.set(client.sessionId, character.attackPower);
 
     const player = new Player();
@@ -108,6 +121,7 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
     this.state.players.delete(client.sessionId);
     this.playerChunks.delete(client.sessionId);
     this.attackPowers.delete(client.sessionId);
+    this.characterNames.delete(client.sessionId);
     client.view?.dispose();
 
     const characterId = this.characterIds.get(client.sessionId);

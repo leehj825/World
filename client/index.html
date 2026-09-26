@@ -7,7 +7,12 @@
     <title>client</title>
   </head>
   <body>
-    <div id="app"></div>
+    <!--
+      This workspace is now a library consumed by ui/ (see src/index.ts):
+      `initGame`, the EventBus, and the auth API. This page exists only so
+      `vite build`/`tsc` still exercise main.ts as a standalone entry for CI;
+      open ui/'s dev server to actually play.
+    -->
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

@@ -10,3 +10,15 @@ export interface CombatEvent {
   targetId: string;
   damage: number;
 }
+
+/** Client -> server: a chat message to broadcast. The sender is never taken
+ * from the client — the server fills it in from the authenticated character. */
+export interface ChatInput {
+  text: string;
+}
+
+/** Server -> clients: a chat message, with the server-resolved sender name. */
+export interface ChatMessage {
+  sender: string;
+  text: string;
+}
