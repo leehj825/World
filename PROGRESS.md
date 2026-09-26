@@ -143,6 +143,45 @@ the bottom.
   asked for explicitly, but added so that helper is actually exercised by
   something instead of shipping as a dead/never-called export.
 
+## Phase 5 continued: Inventory & private state
+
+- **Database:** `InventoryItem` model (`characterId`, `itemId`,
+  `slotIndex`, `quantity`; unique on `characterId`+`slotIndex`).
+  `auth.ts` grants 5 `health_potion`s in slot 0 on registration, nested
+  three levels deep in one Prisma create (`Account` → `Character` →
+  `InventoryItem`).
+- **Private state:** `shared/Player.ts` gained `inventory` (a
+  `MapSchema<InventoryItem>` keyed by slot index) decorated
+  `@view(INVENTORY_VIEW_TAG)` — a *custom* tag, not the bare `@view()`
+  already used for `GameState.players`. This is the actual privacy
+  mechanism: being visible in someone's `players` map (base AOI
+  visibility) does **not** imply visibility of every field on that
+  entity — a field behind a custom tag is only visible to a view that
+  was explicitly granted that exact tag. `GameRoom` grants it only to a
+  client's own player (`client.view.add(player, INVENTORY_VIEW_TAG)` at
+  `onJoin`); the AOI loop that adds nearby players to each other's views
+  never passes this tag, so a nearby player's inventory is structurally
+  absent from your view — not hidden client-side, never encoded to your
+  client at all. Verified directly: session A's view of session B has
+  `x`/`y`/`hp` populated but `inventory` is `undefined`, while A's own
+  inventory is fully populated.
+- **Server logic:** `GameRoom`'s `move_item` handler validates slot range
+  and that the source slot actually holds an item — the client's two
+  slot numbers are the only untrusted input — then swaps the two
+  `MapSchema` entries authoritatively.
+- **Persistence:** `StateSyncService` gained a second dirty-tracking path
+  for inventories, sharing the same FIFO `writeQueue` as position/hp so a
+  flush and a disconnect-save can never land out of order for the same
+  character. Inventory is one-row-per-item rather than one-row-per-character,
+  so a "move" can't be expressed as a single `UPDATE` the way x/y/hp can;
+  persist instead replaces a dirty character's whole slot set
+  (`deleteMany` + `createMany`) from the in-memory snapshot taken at
+  `markInventoryDirty()` time.
+- **React UI:** `EventBus` gained `emitInventoryChange`/`onInventoryChange`
+  and a `move_item` intent variant. `InventoryGrid.tsx` is a 4x5 grid
+  toggled by an on-screen button or the "I" key, with click-to-select
+  then click-to-swap driving `emitIntent({ type: 'move_item', ... })`.
+
 ---
 
 ## Verification approach
@@ -161,7 +200,7 @@ called done — not just typechecked:
 
 ## Not yet started
 
-- Phase 5 remainder: inventory grid, equipment slots, skill trees (only
-  the event bridge and chat box are done so far).
+- Phase 5 remainder: equipment slots, skill trees (event bridge, chat, and
+  inventory grid are done).
 - Phase 6: Polish, Scale, and Testing (no headless load-testing bots or
   delta-compression tuning yet).
