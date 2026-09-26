@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { Server } from 'colyseus';
 import { WebSocketTransport } from '@colyseus/ws-transport';
 import express from 'express';
@@ -12,6 +13,7 @@ const gameServer = new Server({
     app.use(express.json());
     app.get('/health', (_req, res) => res.send('ok'));
     app.use('/auth', authRouter);
+    app.use('/data', express.static(path.join(process.cwd(), 'data')));
   },
 });
 
