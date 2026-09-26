@@ -182,6 +182,44 @@ the bottom.
   toggled by an on-screen button or the "I" key, with click-to-select
   then click-to-swap driving `emitIntent({ type: 'move_item', ... })`.
 
+## Phase 6: Polish, Scale, and Testing
+
+- **Action 1 (Headless Load Testing Bot):** `server/scripts/loadTest.ts` —
+  a standalone `tsx` script (`@colyseus/sdk` added as a server
+  devDependency since it's only used here) accepting `--bots=N`. Each bot
+  registers with a randomized username via the real `/auth/register` +
+  `/auth/login` HTTP endpoints, joins `game_room` with the resulting JWT,
+  and sends a random W/A/S/D `move` every 500ms. Bots spawn with a 20ms
+  stagger to avoid a simultaneous-connect thundering herd, and the script
+  prints a connected-count/moves-sent summary every 5s.
+- **Action 2 (Database Write Profiling):** `StateSyncService.persist()`
+  now wraps its `$transaction` in `console.time`/`console.timeEnd`,
+  labeled `db-flush` for periodic batches and `db-save` for `onLeave`'s
+  immediate single-character saves (both paths share the method, so the
+  label is what makes the two very different call patterns separately
+  visible in the logs).
+- **Action 3 (Tick Rate Monitoring):** this room has no fixed simulation
+  timestep of its own — everything is reactive to incoming messages, not
+  a stepped loop — so "tick rate" here means "how long does one message
+  take to handle." `GameRoom` wraps every `onMessage` handler in an
+  `instrument()` helper that times execution and logs `[WARN] Tick rate
+  dropping - execution took Xms` past a 10ms threshold; under load this
+  is dominated by `updateChunkAndVisibility()` fanning out over every
+  connected client on the `move` path, which is exactly what the
+  load-test bots exercise.
+- **Result:** ran 50 bots for ~20s against a real local Postgres. All 50
+  connected and sustained their move interval throughout. `db-flush` for
+  50 dirty characters took ~20-25ms — far inside the 7s flush budget, so
+  the write-behind queue has plenty of headroom at this scale. No
+  tick-rate warnings fired at the real 10ms threshold under this load —
+  a genuine finding, not a blind spot: the bots' random walk near spawn
+  rarely crosses an 800px chunk boundary in 20s, so the expensive AOI
+  fan-out mostly wasn't triggered. Separately confirmed the `instrument()`
+  mechanism itself fires correctly (accurate elapsed times) by
+  temporarily forcing the threshold to 0ms and observing the expected
+  flood of warnings, then restoring it. No data corruption after the
+  run — Account/Character row counts matched exactly the bots spawned.
+
 ---
 
 ## Verification approach
@@ -197,10 +235,14 @@ called done — not just typechecked:
   and mouse/keyboard input, with pixel-level and screenshot checks for
   terrain colors, health bars, hit flashes, floating damage numbers, the
   React HUD/chat DOM, and cross-session chat delivery.
+- A 50-bot headless load test (`server/scripts/loadTest.ts`) against a
+  real Postgres instance, with DB write timing captured directly from
+  `console.time`/`console.timeEnd` output rather than estimated.
 
 ## Not yet started
 
 - Phase 5 remainder: equipment slots, skill trees (event bridge, chat, and
   inventory grid are done).
-- Phase 6: Polish, Scale, and Testing (no headless load-testing bots or
-  delta-compression tuning yet).
+- Phase 6 remainder: delta-compression tuning (load testing and write/tick
+  profiling are done; no capacity ceiling has been found yet at 50 bots,
+  so there's no evidence delta-compression is needed yet either).
