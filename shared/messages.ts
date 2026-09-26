@@ -22,3 +22,9 @@ export interface ChatMessage {
   sender: string;
   text: string;
 }
+
+/** Client -> server: swap the items (if any) between two inventory slots. */
+export interface MoveItemMessage {
+  fromSlot: number;
+  toSlot: number;
+}

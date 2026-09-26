@@ -3,6 +3,7 @@ import { initGame } from 'client'
 import LoginForm from './components/LoginForm.tsx'
 import ChatBox from './components/ChatBox.tsx'
 import HudBar from './components/HudBar.tsx'
+import InventoryGrid from './components/InventoryGrid.tsx'
 import './App.css'
 
 function App() {
@@ -34,6 +35,7 @@ function App() {
           <>
             <HudBar />
             <ChatBox />
+            <InventoryGrid />
           </>
         )}
       </div>

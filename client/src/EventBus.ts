@@ -30,8 +30,23 @@ export function emitGameStateChange(snapshot: GameStateSnapshot): void {
   emit('game_state_change', snapshot)
 }
 
+/** One occupied inventory slot, as displayed by the UI. */
+export interface InventorySlot {
+  slotIndex: number
+  itemId: string
+  quantity: number
+}
+
+export function emitInventoryChange(slots: InventorySlot[]): void {
+  emit('inventory_change', slots)
+}
+
+export function onInventoryChange(handler: (slots: InventorySlot[]) => void): () => void {
+  return subscribe('inventory_change', handler)
+}
+
 /** React -> game engine: an intent for the engine to carry out. */
-export type Intent = { type: 'chat'; text: string }
+export type Intent = { type: 'chat'; text: string } | { type: 'move_item'; fromSlot: number; toSlot: number }
 
 export function emitIntent(intent: Intent): void {
   emit('intent', intent)

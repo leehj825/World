@@ -16,13 +16,25 @@ model Account {
 }
 
 model Character {
-  id          String  @id @default(uuid())
-  accountId   String
-  account     Account @relation(fields: [accountId], references: [id])
-  name        String
-  x           Float   @default(0)
-  y           Float   @default(0)
-  hp          Int     @default(100)
-  maxHp       Int     @default(100)
-  attackPower Int     @default(10)
+  id             String          @id @default(uuid())
+  accountId      String
+  account        Account         @relation(fields: [accountId], references: [id])
+  name           String
+  x              Float           @default(0)
+  y              Float           @default(0)
+  hp             Int             @default(100)
+  maxHp          Int             @default(100)
+  attackPower    Int             @default(10)
+  inventoryItems InventoryItem[]
+}
+
+model InventoryItem {
+  id          String    @id @default(uuid())
+  characterId String
+  character   Character @relation(fields: [characterId], references: [id])
+  itemId      String
+  slotIndex   Int
+  quantity    Int       @default(1)
+
+  @@unique([characterId, slotIndex])
 }

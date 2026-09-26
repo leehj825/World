@@ -3,7 +3,18 @@ import type { Client } from 'colyseus';
 import { StateView } from '@colyseus/schema';
 import jwt from 'jsonwebtoken';
 import { prisma } from 'database';
-import { AttackMessage, ChatInput, ChatMessage, CombatEvent, GameState, Player, worldToChunk } from 'shared';
+import {
+  AttackMessage,
+  ChatInput,
+  ChatMessage,
+  CombatEvent,
+  GameState,
+  INVENTORY_VIEW_TAG,
+  InventoryItem,
+  MoveItemMessage,
+  Player,
+  worldToChunk,
+} from 'shared';
 import { StateSyncService } from './StateSyncService.js';
 
 const jwtSecretEnv = process.env.JWT_SECRET;
@@ -14,6 +25,7 @@ const JWT_SECRET: string = jwtSecretEnv;
 
 const MELEE_RANGE = 48;
 const CHAT_MAX_LENGTH = 500;
+const INVENTORY_SLOT_COUNT = 20;
 
 interface MoveMessage {
   x: number;
@@ -70,6 +82,10 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
       const sender = this.characterNames.get(client.sessionId) ?? 'Unknown';
       this.broadcast('chat_message', { sender, text } satisfies ChatMessage);
     });
+
+    this.onMessage<MoveItemMessage>('move_item', (client, message) => {
+      this.handleMoveItem(client, message);
+    });
   }
 
   onAuth(_client: GameClient, options: AuthOptions): AuthResult {
@@ -95,6 +111,7 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
 
     const character = await prisma.character.findFirst({
       where: { accountId: client.auth.accountId },
+      include: { inventoryItems: true },
     });
     if (!character) {
       throw new Error('no character found for this account');
@@ -109,10 +126,20 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
     player.y = character.y;
     player.hp = character.hp;
     player.maxHp = character.maxHp;
+    for (const row of character.inventoryItems) {
+      const item = new InventoryItem();
+      item.itemId = row.itemId;
+      item.quantity = row.quantity;
+      player.inventory.set(String(row.slotIndex), item);
+    }
     this.state.players.set(client.sessionId, player);
 
     client.view = new StateView();
-    client.view.add(player); // always visible to itself, regardless of chunk
+    // Granting INVENTORY_VIEW_TAG here (in addition to base visibility) is
+    // what makes `inventory` visible to this client at all — nearby clients
+    // added via updateChunkAndVisibility() below never get this tag, so
+    // they see this player's x/y/hp but never their inventory.
+    client.view.add(player, INVENTORY_VIEW_TAG);
 
     this.updateChunkAndVisibility(client, player.x, player.y);
   }
@@ -183,6 +210,58 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
     if (characterId) {
       this.stateSync.markDirty(characterId, player.x, player.y, player.hp);
     }
+  }
+
+  /**
+   * Authoritatively swaps two inventory slots. `fromSlot`/`toSlot` are the
+   * only client input trusted here — everything about whether the move is
+   * legal (slot range, an item actually being present) and the resulting
+   * item data comes from server-side state.
+   */
+  private handleMoveItem(client: GameClient, message: MoveItemMessage): void {
+    const { fromSlot, toSlot } = message ?? {};
+    if (
+      !Number.isInteger(fromSlot) ||
+      !Number.isInteger(toSlot) ||
+      fromSlot < 0 ||
+      fromSlot >= INVENTORY_SLOT_COUNT ||
+      toSlot < 0 ||
+      toSlot >= INVENTORY_SLOT_COUNT ||
+      fromSlot === toSlot
+    ) {
+      return;
+    }
+
+    const player = this.state.players.get(client.sessionId);
+    if (!player) return;
+
+    const fromKey = String(fromSlot);
+    const toKey = String(toSlot);
+
+    const fromItem = player.inventory.get(fromKey);
+    if (!fromItem) return; // nothing to move
+
+    const toItem = player.inventory.get(toKey);
+    if (toItem) {
+      player.inventory.set(fromKey, toItem);
+    } else {
+      player.inventory.delete(fromKey);
+    }
+    player.inventory.set(toKey, fromItem);
+
+    this.persistInventory(client.sessionId, player);
+  }
+
+  private persistInventory(sessionId: string, player: Player): void {
+    const characterId = this.characterIds.get(sessionId);
+    if (!characterId) return;
+
+    const slots = Array.from(player.inventory.entries(), ([slotIndex, item]) => ({
+      slotIndex: Number(slotIndex),
+      itemId: item.itemId,
+      quantity: item.quantity,
+    }));
+    this.stateSync.markInventoryDirty(characterId, slots);
   }
 
   /**

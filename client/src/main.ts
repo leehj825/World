@@ -13,9 +13,10 @@ import {
   type ChatMessage,
   type CombatEvent,
   type MapChunk,
+  type MoveItemMessage,
 } from 'shared'
 import { SERVER_HTTP_URL } from './api.js'
-import { emitChatMessage, emitGameStateChange, onIntent } from './EventBus.js'
+import { emitChatMessage, emitGameStateChange, emitInventoryChange, onIntent, type InventorySlot } from './EventBus.js'
 
 const SERVER_WS_URL = 'ws://localhost:2567'
 
@@ -221,6 +222,12 @@ export async function initGame(canvas: HTMLCanvasElement, token: string): Promis
     if (localPlayer) {
       chunkManager.update(localPlayer.x, localPlayer.y)
       emitGameStateChange({ hp: localPlayer.hp, maxHp: localPlayer.maxHp, playerCount: state.players.size })
+
+      const slots: InventorySlot[] = []
+      localPlayer.inventory.forEach((item, slotIndex) => {
+        slots.push({ slotIndex: Number(slotIndex), itemId: item.itemId, quantity: item.quantity })
+      })
+      emitInventoryChange(slots)
     }
   }
 
@@ -261,6 +268,8 @@ export async function initGame(canvas: HTMLCanvasElement, token: string): Promis
   onIntent((intent) => {
     if (intent.type === 'chat') {
       room.send('chat_message', { text: intent.text } satisfies ChatInput)
+    } else if (intent.type === 'move_item') {
+      room.send('move_item', { fromSlot: intent.fromSlot, toSlot: intent.toSlot } satisfies MoveItemMessage)
     }
   })
 

@@ -34,7 +34,14 @@ authRouter.post('/register', async (req, res) => {
       username,
       passwordHash,
       characters: {
-        create: { name: username, x: 0, y: 0 },
+        create: {
+          name: username,
+          x: 0,
+          y: 0,
+          inventoryItems: {
+            create: { itemId: 'health_potion', slotIndex: 0, quantity: 5 },
+          },
+        },
       },
     },
   });
