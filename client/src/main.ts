@@ -1,6 +1,6 @@
 import './style.css'
 import { Client } from '@colyseus/sdk'
-import type { GameState } from 'shared'
+import type { GameState, Player } from 'shared'
 import {
   CHUNK_SIZE_PX,
   CHUNK_TILES,
@@ -9,6 +9,8 @@ import {
   chunkFileName,
   isValidChunk,
   worldToChunk,
+  type AttackMessage,
+  type CombatEvent,
   type MapChunk,
 } from 'shared'
 
@@ -54,6 +56,12 @@ const errorMessage = authForm.querySelector<HTMLParagraphElement>('.auth-error')
 
 const PLAYER_SIZE = 16
 const MOVE_STEP = 4
+const FLASH_DURATION_MS = 150
+const DAMAGE_NUMBER_LIFETIME_MS = 800
+const DAMAGE_NUMBER_RISE_PX = 30
+const HEALTH_BAR_WIDTH = 24
+const HEALTH_BAR_HEIGHT = 4
+const HEALTH_BAR_OFFSET_Y = 14
 
 const TILE_COLORS: Record<TileType, string> = {
   [TileType.Water]: '#2b6cb0',
@@ -144,6 +152,20 @@ class ChunkManager {
 
 const chunkManager = new ChunkManager()
 
+/** Hit-reaction state driven by transient `combat_event` messages, kept
+ * separate from authoritative state so it can animate independently of the
+ * server's patch rate. */
+interface FloatingDamage {
+  targetId: string
+  damage: number
+  x: number
+  y: number
+  startedAt: number
+}
+
+const flashUntil = new Map<string, number>()
+let floatingDamages: FloatingDamage[] = []
+
 function drawTerrain(cameraX: number, cameraY: number) {
   for (const chunk of chunkManager.loadedChunks()) {
     const chunkOriginX = chunk.chunkX * CHUNK_SIZE_PX
@@ -165,7 +187,38 @@ function drawTerrain(cameraX: number, cameraY: number) {
   }
 }
 
+function drawHealthBar(screenX: number, screenY: number, player: Player) {
+  const barX = screenX - HEALTH_BAR_WIDTH / 2
+  const barY = screenY - HEALTH_BAR_OFFSET_Y
+  const ratio = player.maxHp > 0 ? Math.max(0, Math.min(1, player.hp / player.maxHp)) : 0
+
+  ctx.fillStyle = '#3a1010'
+  ctx.fillRect(barX, barY, HEALTH_BAR_WIDTH, HEALTH_BAR_HEIGHT)
+  ctx.fillStyle = '#2ecc40'
+  ctx.fillRect(barX, barY, HEALTH_BAR_WIDTH * ratio, HEALTH_BAR_HEIGHT)
+}
+
+function drawFloatingDamage(now: number, cameraX: number, cameraY: number) {
+  floatingDamages = floatingDamages.filter((entry) => now - entry.startedAt < DAMAGE_NUMBER_LIFETIME_MS)
+
+  for (const entry of floatingDamages) {
+    const elapsed = now - entry.startedAt
+    const progress = elapsed / DAMAGE_NUMBER_LIFETIME_MS
+
+    const screenX = entry.x - cameraX
+    const screenY = entry.y - cameraY - PLAYER_SIZE / 2 - progress * DAMAGE_NUMBER_RISE_PX
+
+    ctx.globalAlpha = 1 - progress
+    ctx.fillStyle = '#ff4d4d'
+    ctx.font = 'bold 14px system-ui, sans-serif'
+    ctx.textAlign = 'center'
+    ctx.fillText(`-${entry.damage}`, screenX, screenY)
+    ctx.globalAlpha = 1
+  }
+}
+
 function draw(state: GameState, sessionId: string) {
+  const now = performance.now()
   const localPlayer = state.players.get(sessionId)
   const cameraX = (localPlayer?.x ?? 0) - canvas.width / 2
   const cameraY = (localPlayer?.y ?? 0) - canvas.height / 2
@@ -174,14 +227,17 @@ function draw(state: GameState, sessionId: string) {
   drawTerrain(cameraX, cameraY)
 
   state.players.forEach((player, id) => {
-    ctx.fillStyle = id === sessionId ? '#aa3bff' : '#f3f4f6'
-    ctx.fillRect(
-      player.x - cameraX - PLAYER_SIZE / 2,
-      player.y - cameraY - PLAYER_SIZE / 2,
-      PLAYER_SIZE,
-      PLAYER_SIZE,
-    )
+    const screenX = player.x - cameraX
+    const screenY = player.y - cameraY
+
+    const isFlashing = (flashUntil.get(id) ?? 0) > now
+    ctx.fillStyle = isFlashing ? '#ff3b3b' : id === sessionId ? '#aa3bff' : '#f3f4f6'
+    ctx.fillRect(screenX - PLAYER_SIZE / 2, screenY - PLAYER_SIZE / 2, PLAYER_SIZE, PLAYER_SIZE)
+
+    drawHealthBar(screenX, screenY, player)
   })
+
+  drawFloatingDamage(now, cameraX, cameraY)
 
   if (localPlayer) {
     chunkManager.update(localPlayer.x, localPlayer.y)
@@ -209,14 +265,59 @@ async function connectToGameRoom(token: string) {
 
   authOverlay.remove()
 
+  let latestState: GameState | null = null
   room.onStateChange((state) => {
-    draw(state, room.sessionId)
+    latestState = state
+  })
+
+  const renderLoop = () => {
+    if (latestState) {
+      draw(latestState, room.sessionId)
+    }
+    requestAnimationFrame(renderLoop)
+  }
+  requestAnimationFrame(renderLoop)
+
+  room.onMessage<CombatEvent>('combat_event', (event) => {
+    const now = performance.now()
+    flashUntil.set(event.targetId, now + FLASH_DURATION_MS)
+
+    const target = latestState?.players.get(event.targetId)
+    floatingDamages.push({
+      targetId: event.targetId,
+      damage: event.damage,
+      x: target?.x ?? 0,
+      y: target?.y ?? 0,
+      startedAt: now,
+    })
   })
 
   window.addEventListener('keydown', (event) => {
     const move = keyToMove[event.key.toLowerCase()]
     if (!move) return
     room.send('move', move)
+  })
+
+  canvas.addEventListener('click', (event) => {
+    if (!latestState) return
+
+    const localPlayer = latestState.players.get(room.sessionId)
+    const cameraX = (localPlayer?.x ?? 0) - canvas.width / 2
+    const cameraY = (localPlayer?.y ?? 0) - canvas.height / 2
+
+    const rect = canvas.getBoundingClientRect()
+    const clickX = event.clientX - rect.left + cameraX
+    const clickY = event.clientY - rect.top + cameraY
+
+    latestState.players.forEach((player, id) => {
+      if (id === room.sessionId) return
+
+      const withinX = Math.abs(clickX - player.x) <= PLAYER_SIZE / 2
+      const withinY = Math.abs(clickY - player.y) <= PLAYER_SIZE / 2
+      if (withinX && withinY) {
+        room.send('attack', { targetId: id } satisfies AttackMessage)
+      }
+    })
   })
 }
 

@@ -3,7 +3,7 @@ import type { Client } from 'colyseus';
 import { StateView } from '@colyseus/schema';
 import jwt from 'jsonwebtoken';
 import { prisma } from 'database';
-import { GameState, Player, worldToChunk } from 'shared';
+import { AttackMessage, CombatEvent, GameState, Player, worldToChunk } from 'shared';
 import { StateSyncService } from './StateSyncService.js';
 
 const jwtSecretEnv = process.env.JWT_SECRET;
@@ -11,6 +11,8 @@ if (!jwtSecretEnv) {
   throw new Error('JWT_SECRET environment variable is required');
 }
 const JWT_SECRET: string = jwtSecretEnv;
+
+const MELEE_RANGE = 48;
 
 interface MoveMessage {
   x: number;
@@ -35,6 +37,7 @@ type GameClient = Client<{ auth: AuthResult }>;
 export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
   private readonly stateSync = new StateSyncService();
   private readonly characterIds = new Map<string, string>();
+  private readonly attackPowers = new Map<string, number>();
   private readonly playerChunks = new Map<string, ChunkCoords>();
 
   onCreate() {
@@ -48,12 +51,12 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
       player.x += message.x;
       player.y += message.y;
 
-      const characterId = this.characterIds.get(client.sessionId);
-      if (characterId) {
-        this.stateSync.markDirty(characterId, player.x, player.y);
-      }
-
+      this.persistCharacter(client.sessionId, player);
       this.updateChunkAndVisibility(client, player.x, player.y);
+    });
+
+    this.onMessage<AttackMessage>('attack', (client, message) => {
+      this.handleAttack(client, message);
     });
   }
 
@@ -86,10 +89,13 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
     }
 
     this.characterIds.set(client.sessionId, character.id);
+    this.attackPowers.set(client.sessionId, character.attackPower);
 
     const player = new Player();
     player.x = character.x;
     player.y = character.y;
+    player.hp = character.hp;
+    player.maxHp = character.maxHp;
     this.state.players.set(client.sessionId, player);
 
     client.view = new StateView();
@@ -101,6 +107,7 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
   async onLeave(client: GameClient) {
     this.state.players.delete(client.sessionId);
     this.playerChunks.delete(client.sessionId);
+    this.attackPowers.delete(client.sessionId);
     client.view?.dispose();
 
     const characterId = this.characterIds.get(client.sessionId);
@@ -113,6 +120,55 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
 
   onDispose() {
     this.stateSync.stop();
+  }
+
+  /**
+   * Validates and applies one attack: both participants must exist and be
+   * within melee range, checked authoritatively from server-side state (the
+   * client's `targetId` is untrusted input, nothing else). Damage always
+   * comes from the attacker's own server-tracked attackPower, never anything
+   * the client sends. A kill resets the target to full hp and teleports them
+   * to (0, 0) — the same "respawn" the client already renders as a normal
+   * state update.
+   */
+  private handleAttack(client: GameClient, message: AttackMessage): void {
+    if (typeof message?.targetId !== 'string' || message.targetId === client.sessionId) {
+      return;
+    }
+
+    const attacker = this.state.players.get(client.sessionId);
+    const target = this.state.players.get(message.targetId);
+    if (!attacker || !target) return;
+
+    const dx = attacker.x - target.x;
+    const dy = attacker.y - target.y;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    if (distance > MELEE_RANGE) return;
+
+    const attackPower = this.attackPowers.get(client.sessionId) ?? 0;
+    target.hp = Math.max(0, target.hp - attackPower);
+
+    this.broadcast('combat_event', { targetId: message.targetId, damage: attackPower } satisfies CombatEvent);
+
+    if (target.hp <= 0) {
+      target.hp = target.maxHp;
+      target.x = 0;
+      target.y = 0;
+
+      const targetClient = this.clients.get(message.targetId);
+      if (targetClient) {
+        this.updateChunkAndVisibility(targetClient, target.x, target.y);
+      }
+    }
+
+    this.persistCharacter(message.targetId, target);
+  }
+
+  private persistCharacter(sessionId: string, player: Player): void {
+    const characterId = this.characterIds.get(sessionId);
+    if (characterId) {
+      this.stateSync.markDirty(characterId, player.x, player.y, player.hp);
+    }
   }
 
   /**

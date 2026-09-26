@@ -16,10 +16,13 @@ model Account {
 }
 
 model Character {
-  id        String  @id @default(uuid())
-  accountId String
-  account   Account @relation(fields: [accountId], references: [id])
-  name      String
-  x         Float   @default(0)
-  y         Float   @default(0)
+  id          String  @id @default(uuid())
+  accountId   String
+  account     Account @relation(fields: [accountId], references: [id])
+  name        String
+  x           Float   @default(0)
+  y           Float   @default(0)
+  hp          Int     @default(100)
+  maxHp       Int     @default(100)
+  attackPower Int     @default(10)
 }

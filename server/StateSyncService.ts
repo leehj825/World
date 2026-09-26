@@ -1,14 +1,16 @@
 import { prisma } from 'database';
 
-interface PendingPosition {
+interface PendingCharacterState {
   x: number;
   y: number;
+  hp: number;
 }
 
 /**
- * Write-behind cache for Character positions. `move` messages only ever
- * touch the in-memory `dirty` map (synchronous, cheap); the actual Postgres
- * write happens on a timer so the game loop is never blocked on I/O.
+ * Write-behind cache for Character position and hp. `move` and combat
+ * handlers only ever touch the in-memory `dirty` map (synchronous, cheap);
+ * the actual Postgres write happens on a timer so the game loop is never
+ * blocked on I/O.
  *
  * Concurrency: every DB write — periodic batch flushes and the one-off
  * `saveNow()` used on disconnect — runs through a single FIFO `writeQueue`
@@ -21,7 +23,7 @@ interface PendingPosition {
  * with a concurrent flush.
  */
 export class StateSyncService {
-  private dirty = new Map<string, PendingPosition>();
+  private dirty = new Map<string, PendingCharacterState>();
   private writeQueue: Promise<void> = Promise.resolve();
   private timer: ReturnType<typeof setInterval> | null = null;
 
@@ -44,9 +46,9 @@ export class StateSyncService {
     }
   }
 
-  /** Called from the `move` handler. Cheap, synchronous, never touches the DB. */
-  markDirty(characterId: string, x: number, y: number): void {
-    this.dirty.set(characterId, { x, y });
+  /** Called from the `move`/`attack` handlers. Cheap, synchronous, never touches the DB. */
+  markDirty(characterId: string, x: number, y: number, hp: number): void {
+    this.dirty.set(characterId, { x, y, hp });
   }
 
   /**
@@ -82,7 +84,7 @@ export class StateSyncService {
     return this.enqueue(new Map([[characterId, pending]]));
   }
 
-  private enqueue(entries: Map<string, PendingPosition>): Promise<void> {
+  private enqueue(entries: Map<string, PendingCharacterState>): Promise<void> {
     this.writeQueue = this.writeQueue.then(
       () => this.persist(entries),
       () => this.persist(entries), // keep the queue alive even if a prior job rejected
@@ -90,13 +92,13 @@ export class StateSyncService {
     return this.writeQueue;
   }
 
-  private async persist(entries: Map<string, PendingPosition>): Promise<void> {
+  private async persist(entries: Map<string, PendingCharacterState>): Promise<void> {
     if (entries.size === 0) return;
 
     try {
       await prisma.$transaction(
-        Array.from(entries, ([characterId, { x, y }]) =>
-          prisma.character.update({ where: { id: characterId }, data: { x, y } }),
+        Array.from(entries, ([characterId, { x, y, hp }]) =>
+          prisma.character.update({ where: { id: characterId }, data: { x, y, hp } }),
         ),
       );
     } catch (error) {
