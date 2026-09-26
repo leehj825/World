@@ -1,1 +1,2 @@
-export const hello = 'world';
+export { Player } from './Player.js';
+export { GameState } from './GameState.js';

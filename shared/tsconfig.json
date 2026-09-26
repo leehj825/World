@@ -36,6 +36,12 @@
     "strict": true,
     "jsx": "react-jsx",
 
+    // @colyseus/schema uses legacy (experimentalDecorators) property decorators,
+    // which requires class fields to assign onto the prototype accessor rather
+    // than defining an own property that would shadow it.
+    "experimentalDecorators": true,
+    "useDefineForClassFields": false,
+
     "isolatedModules": true,
     "noUncheckedSideEffectImports": true,
     "moduleDetection": "force",
