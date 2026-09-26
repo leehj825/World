@@ -104,6 +104,45 @@ the bottom.
   same `StateSyncService.markDirty()` path from Phase 2, so combat damage
   rides the existing write-behind queue.
 
+## Phase 5: Decoupled UI & Inventory (chat, event bridge)
+
+- **Action 1 (Event Bridge):** `client/src/EventBus.ts` — a zero-dependency
+  pub/sub over native `window` `CustomEvent`s
+  (`emitGameStateChange`/`onGameStateChange`, `emitIntent`/`onIntent`,
+  `emitChatMessage`/`onChatMessage`). Neither side imports the other
+  directly; this module is the only shared surface. `client/src/main.ts`
+  no longer mounts anything itself — it now exports `initGame(canvas,
+  token)`, which takes an externally-owned canvas and resizes to fill it.
+  `client/package.json` points `main`/`types` straight at `src/index.ts`
+  (no build step; Vite transforms the raw `.ts` on import like any other
+  source file).
+- **Action 2 (React Integration):** `ui` now depends on `client`.
+  `App.tsx` holds a `useRef<HTMLCanvasElement>`, calls `initGame` in a
+  `useEffect` once a JWT is available, and wraps overlay panels in a
+  `pointer-events: none` container so clicks fall through to the canvas
+  everywhere except an actual panel (which opts back in with
+  `pointer-events: auto`) — this matters because Phase 4's
+  click-to-attack still needs to reach the canvas through the UI layer.
+  `LoginForm.tsx` is the HTML login form migrated into a real React
+  component managing its own state, calling `initGame`'s token callback
+  on success.
+  - **Deviation:** `ui/vite.config.ts` needed `optimizeDeps.include:
+    ['shared', 'client']` — the same fix from Phase 3's `client/vite.config.ts`,
+    needed again here because `shared`'s compiled CommonJS is now reached
+    transitively through `client` too, and Vite would otherwise serve it
+    as unconverted ESM via `/@fs`.
+- **Action 3 (Global Chat):** `shared/messages.ts` gained `ChatInput`
+  (`{ text }`, client → server) and `ChatMessage` (`{ sender, text }`,
+  server → clients) — the client never sends a sender name; `GameRoom`
+  resolves it from the authenticated character, the same trust boundary
+  established for `attackPower` in Phase 4. `GameRoom`'s new
+  `chat_message` handler trims/caps the text and broadcasts room-wide.
+  `ChatBox.tsx` sends via `emitIntent({ type: 'chat', text })` and renders
+  incoming messages via `onChatMessage`.
+- Added `HudBar.tsx` (a live HP readout via `onGameStateChange`) — not
+  asked for explicitly, but added so that helper is actually exercised by
+  something instead of shipping as a dead/never-called export.
+
 ---
 
 ## Verification approach
@@ -117,11 +156,12 @@ called done — not just typechecked:
   DB rows.
 - Headless-browser (Playwright) runs driving the real login form, canvas,
   and mouse/keyboard input, with pixel-level and screenshot checks for
-  terrain colors, health bars, hit flashes, and floating damage numbers.
+  terrain colors, health bars, hit flashes, floating damage numbers, the
+  React HUD/chat DOM, and cross-session chat delivery.
 
 ## Not yet started
 
-- Phase 5: Decoupled UI & Inventory (the `ui/` workspace is scaffolded but
-  has no event bridge or inventory/equipment/chat components yet).
+- Phase 5 remainder: inventory grid, equipment slots, skill trees (only
+  the event bridge and chat box are done so far).
 - Phase 6: Polish, Scale, and Testing (no headless load-testing bots or
   delta-compression tuning yet).
