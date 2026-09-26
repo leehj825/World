@@ -16,12 +16,17 @@
   "type": "commonjs",
   "dependencies": {
     "@types/express": "^5.0.6",
+    "bcrypt": "^6.0.0",
     "colyseus": "^0.18.8",
+    "database": "*",
     "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
     "shared": "*",
     "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.52.0"
   },
   "devDependencies": {
+    "@types/bcrypt": "^6.0.0",
+    "@types/jsonwebtoken": "^9.0.10",
     "tsx": "^4.19.2",
     "typescript": "^7.0.2"
   }

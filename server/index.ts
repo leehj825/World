@@ -1,5 +1,7 @@
 import { Server } from 'colyseus';
 import { WebSocketTransport } from '@colyseus/ws-transport';
+import express from 'express';
+import { authRouter } from './auth.js';
 import { GameRoom } from './GameRoom.js';
 
 const PORT = 2567;
@@ -7,7 +9,9 @@ const PORT = 2567;
 const gameServer = new Server({
   transport: new WebSocketTransport(),
   express: (app) => {
+    app.use(express.json());
     app.get('/health', (_req, res) => res.send('ok'));
+    app.use('/auth', authRouter);
   },
 });
 
