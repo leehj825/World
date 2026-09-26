@@ -12,4 +12,6 @@ jobs:
         with:
           node-version: 22
       - run: npm install
-      - run: npm run build --workspaces
+      - run: npm run lint --workspaces --if-present
+      - run: npm run typecheck --workspaces --if-present
+      - run: npm run build --workspaces --if-present
