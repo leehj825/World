@@ -27,6 +27,11 @@ const MELEE_RANGE = 48;
 const CHAT_MAX_LENGTH = 500;
 const INVENTORY_SLOT_COUNT = 20;
 
+/** If a single message handler takes longer than this, something (usually
+ * AOI recalculation fanning out over many connected clients) is eating into
+ * the room's ability to keep up with incoming messages — worth a warning. */
+const TICK_WARN_THRESHOLD_MS = 10;
+
 interface MoveMessage {
   x: number;
   y: number;
@@ -58,34 +63,61 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
     this.setState(new GameState());
     this.stateSync.start();
 
-    this.onMessage<MoveMessage>('move', (client, message) => {
-      const player = this.state.players.get(client.sessionId);
-      if (!player) return;
+    this.onMessage<MoveMessage>('move', this.instrument('move', (client, message) => this.handleMove(client, message)));
+    this.onMessage<AttackMessage>('attack', this.instrument('attack', (client, message) => this.handleAttack(client, message)));
+    this.onMessage<ChatInput>(
+      'chat_message',
+      this.instrument('chat_message', (client, message) => this.handleChatMessage(client, message)),
+    );
+    this.onMessage<MoveItemMessage>(
+      'move_item',
+      this.instrument('move_item', (client, message) => this.handleMoveItem(client, message)),
+    );
+  }
 
-      player.x += message.x;
-      player.y += message.y;
+  /**
+   * Wraps a message handler with wall-clock timing. This room has no fixed
+   * simulation timestep of its own (everything runs reactively off incoming
+   * messages), so "tick rate" here means "how long does a single message
+   * take to process" — under load (many bots moving) that's dominated by
+   * updateChunkAndVisibility() fanning out over every connected client, so
+   * this is exactly what would show up as the room falling behind.
+   */
+  private instrument<T>(
+    label: string,
+    handler: (client: GameClient, message: T) => void,
+  ): (client: GameClient, message: T) => void {
+    return (client, message) => {
+      const start = performance.now();
+      handler(client, message);
+      const elapsed = performance.now() - start;
+      if (elapsed > TICK_WARN_THRESHOLD_MS) {
+        console.warn(
+          `[WARN] Tick rate dropping - execution took ${elapsed.toFixed(2)}ms (handler=${label}, clients=${this.clients.length})`,
+        );
+      }
+    };
+  }
 
-      this.persistCharacter(client.sessionId, player);
-      this.updateChunkAndVisibility(client, player.x, player.y);
-    });
+  private handleMove(client: GameClient, message: MoveMessage): void {
+    const player = this.state.players.get(client.sessionId);
+    if (!player) return;
 
-    this.onMessage<AttackMessage>('attack', (client, message) => {
-      this.handleAttack(client, message);
-    });
+    player.x += message.x;
+    player.y += message.y;
 
-    this.onMessage<ChatInput>('chat_message', (client, message) => {
-      if (typeof message?.text !== 'string') return;
+    this.persistCharacter(client.sessionId, player);
+    this.updateChunkAndVisibility(client, player.x, player.y);
+  }
 
-      const text = message.text.trim().slice(0, CHAT_MAX_LENGTH);
-      if (!text) return;
+  private handleChatMessage(client: GameClient, message: ChatInput): void {
+    if (typeof message?.text !== 'string') return;
 
-      const sender = this.characterNames.get(client.sessionId) ?? 'Unknown';
-      this.broadcast('chat_message', { sender, text } satisfies ChatMessage);
-    });
+    const text = message.text.trim().slice(0, CHAT_MAX_LENGTH);
+    if (!text) return;
 
-    this.onMessage<MoveItemMessage>('move_item', (client, message) => {
-      this.handleMoveItem(client, message);
-    });
+    const sender = this.characterNames.get(client.sessionId) ?? 'Unknown';
+    this.broadcast('chat_message', { sender, text } satisfies ChatMessage);
   }
 
   onAuth(_client: GameClient, options: AuthOptions): AuthResult {

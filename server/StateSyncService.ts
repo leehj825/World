@@ -83,7 +83,7 @@ export class StateSyncService {
     this.dirty = new Map();
     this.dirtyInventories = new Map();
 
-    return this.enqueue(characters, inventories);
+    return this.enqueue(characters, inventories, 'db-flush');
   }
 
   /**
@@ -108,16 +108,18 @@ export class StateSyncService {
     return this.enqueue(
       character ? new Map([[characterId, character]]) : new Map(),
       inventory ? new Map([[characterId, inventory]]) : new Map(),
+      'db-save',
     );
   }
 
   private enqueue(
     characters: Map<string, PendingCharacterState>,
     inventories: Map<string, PendingInventorySlot[]>,
+    label: string,
   ): Promise<void> {
     this.writeQueue = this.writeQueue.then(
-      () => this.persist(characters, inventories),
-      () => this.persist(characters, inventories), // keep the queue alive even if a prior job rejected
+      () => this.persist(characters, inventories, label),
+      () => this.persist(characters, inventories, label), // keep the queue alive even if a prior job rejected
     );
     return this.writeQueue;
   }
@@ -125,9 +127,16 @@ export class StateSyncService {
   private async persist(
     characters: Map<string, PendingCharacterState>,
     inventories: Map<string, PendingInventorySlot[]>,
+    label: string,
   ): Promise<void> {
     if (characters.size === 0 && inventories.size === 0) return;
 
+    // Measures exactly how long the batch write to Postgres takes, so we
+    // can tell whether the write-behind queue keeps up as the dirty set
+    // grows (e.g. 50+ characters under load-test load) without ever
+    // blocking the room's own message handling — this timer runs on the
+    // FIFO writeQueue, never inline with a game-loop tick.
+    console.time(label);
     try {
       await prisma.$transaction([
         ...Array.from(characters, ([characterId, { x, y, hp }]) =>
@@ -162,6 +171,8 @@ export class StateSyncService {
         }
       }
       throw error;
+    } finally {
+      console.timeEnd(label);
     }
   }
 }
