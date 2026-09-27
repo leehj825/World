@@ -290,14 +290,79 @@ the bottom.
   - The server process itself **never crashed** and kept answering
     `/health` with 200 throughout, even after new connections had
     started failing.
-- **Ceiling: ~1000-1050 concurrent connected players** on this single
-  Node process / single Postgres instance, bottlenecked by connection
-  throughput and tick time together, not by the database or memory. This
-  is a single-process ceiling, not an inherent architectural one — the
-  natural next lever is horizontal scaling (multiple Colyseus room
-  processes / Colyseus's built-in horizontal scaling presence system),
-  which is out of scope for this pass but is exactly what this number
-  would inform.
+- **Ceiling (before the join-pipeline fix below): ~1000-1050 concurrent
+  connected players** on this single Node process / single Postgres
+  instance, bottlenecked by connection throughput and tick time together,
+  not by the database or memory.
+
+### Join-pipeline optimization: eliminating onJoin's database call
+
+Investigated the "seat reservation expired" failures directly rather than
+assuming a cause:
+
+- **bcrypt was already correct.** `auth.ts` calls `bcrypt.hash`/
+  `bcrypt.compare` without a callback, which returns a Promise and runs on
+  libuv's threadpool, not the JS main thread. Confirmed and documented in
+  a comment rather than left ambiguous; no change needed.
+- **The real culprit: `GameRoom.onJoin` ran a database query — one per
+  connecting client — inside Colyseus's seat-reservation window.**
+  `prisma.character.findFirst({ include: { inventoryItems: true } })` on
+  every join meant that under a burst of simultaneous connections, those
+  queries (and the real main-thread CPU cost of Prisma's request/response
+  marshaling, distinct from the DB wait itself) queued up and competed
+  with the event loop already busy running hundreds of concurrent `move`
+  handlers — exactly the failure pattern observed.
+- **Fix:** `server/session.ts` defines `SessionTokenPayload` — the full
+  spawn snapshot (character id/name, x, y, hp, maxHp, attackPower,
+  inventory). `/auth/login` now fetches the Account with its Character
+  and inventory in the *same* query it already ran (no added DB load) and
+  packs that snapshot into the JWT instead of just `accountId`.
+  `GameRoom.onAuth` verifies the signature and validates the payload
+  shape; `onJoin` no longer touches the database at all — pure signature
+  verification plus synchronous `Player` construction. The JWT's
+  signature is exactly as trusted as `accountId` always was.
+- **Trade-off, documented in `session.ts`:** this is a login-time
+  snapshot, not a live read. The only real staleness scenario — the same
+  account logged in twice, joining with an older token after a newer
+  session already moved — isn't a data-integrity issue (whichever session
+  is actually connected still owns writing the authoritative state), just
+  a possibly-surprising spawn point in an already-unsupported
+  multi-session scenario.
+- **Verified before re-testing at scale:** confirmed the JWT carries the
+  full snapshot, confirmed a fresh join spawns correctly with zero onJoin
+  DB queries, confirmed movement/combat/inventory still persist correctly,
+  and confirmed a tampered token is still rejected.
+- **Result — re-ran the identical progressive stress test:** sustained
+  past the old ~1000-1050 ceiling cleanly (1000, 1100, and 1200 bots all
+  *fully* connected, zero CRITICAL, zero connection failures — the old
+  system's first CRITICAL fired at 824). **New ceiling: ~1300 concurrent
+  connections** — tick-rate CRITICAL onset at 1293 clients (58.51ms,
+  worsening to 160ms by 1297-1300), coinciding with `seat reservation
+  expired` failures resuming. DB flush peaked at 1951ms under this
+  heavier load — still short of the 3000ms critical threshold. The server
+  process never crashed and stayed responsive on `/health` throughout.
+
+**Conclusion:** the join-pipeline fix raised the ceiling from ~1000-1050
+to ~1300 (+25-30%) by removing a real, measured source of main-thread
+contention. Tick rate and connection throughput are still the limiting
+resources together, not the database or memory — this remains a
+single-process ceiling, not an inherent architectural one. The natural
+next lever past ~1300 concurrent players is horizontal scaling (multiple
+Colyseus room processes / Colyseus's built-in horizontal scaling presence
+system), which is out of scope for this pass.
+
+---
+
+## Phase 6: closed
+
+All three actions (headless load testing, DB write profiling, tick-rate
+monitoring) are implemented, the progressive-ramp stress test found and
+then measurably moved a real capacity ceiling (~1000-1050 → ~1300
+concurrent connections) via a verified root-cause fix rather than a
+guess, and every claim in this section was checked against a real
+running stack rather than assumed. Delta-compression tuning and
+horizontal scaling remain open for whenever the next capacity increase is
+actually needed — see "Not yet started" below.
 
 ---
 
@@ -325,8 +390,11 @@ called done — not just typechecked:
 
 - Phase 5 remainder: equipment slots, skill trees (event bridge, chat, and
   inventory grid are done).
-- Phase 6 remainder: delta-compression tuning (the discovered ceiling is a
+- Delta-compression tuning (the discovered ceiling is a
   connection-throughput/tick-time problem on a single process, not a
   wire-size problem, so delta compression wouldn't be the first lever to
-  pull), and horizontal scaling to push past the ~1000-1050 concurrent
-  connection ceiling found by the progressive ramp test.
+  pull), and horizontal scaling to push past the ~1300 concurrent
+  connection ceiling found after the join-pipeline optimization. Neither
+  is needed for MVP launch at the confirmed ~1300-player single-process
+  capacity.
+- Enemy AI, NPC spawners, and loot drops (next up, per the roadmap).
