@@ -207,18 +207,52 @@ the bottom.
   is dominated by `updateChunkAndVisibility()` fanning out over every
   connected client on the `move` path, which is exactly what the
   load-test bots exercise.
-- **Result:** ran 50 bots for ~20s against a real local Postgres. All 50
-  connected and sustained their move interval throughout. `db-flush` for
-  50 dirty characters took ~20-25ms — far inside the 7s flush budget, so
-  the write-behind queue has plenty of headroom at this scale. No
-  tick-rate warnings fired at the real 10ms threshold under this load —
-  a genuine finding, not a blind spot: the bots' random walk near spawn
-  rarely crosses an 800px chunk boundary in 20s, so the expensive AOI
-  fan-out mostly wasn't triggered. Separately confirmed the `instrument()`
-  mechanism itself fires correctly (accurate elapsed times) by
-  temporarily forcing the threshold to 0ms and observing the expected
-  flood of warnings, then restoring it. No data corruption after the
-  run — Account/Character row counts matched exactly the bots spawned.
+- **Result (first pass, 50 bots):** all 50 connected and sustained their
+  move interval; `db-flush` for 50 dirty characters took ~20-25ms — far
+  inside the 7s flush budget. No tick-rate warnings fired, but for a
+  reason that turned out to matter: the bots' pure jitter (new random
+  direction every tick, no sustained travel) kept them orbiting their
+  spawn point at (0, 0) and almost never crossed an 800px chunk boundary
+  in 20s — so `updateChunkAndVisibility()`'s O(n) fan-out, the actual
+  scaling risk, was barely exercised. Caught and reported this as a gap
+  rather than reading "no warnings" as "we're fast."
+
+### Making the load test actually stress AOI
+
+- **Scattered spawning:** `scatterSpawnPosition()` writes a random
+  position across the full 16000x16000px map directly to each bot's
+  `Character` row (via the `database` workspace) right after registration
+  and before joining — `GameRoom.onJoin` always spawns from whatever that
+  row says, so this is not a separate code path from what a real player's
+  spawn hits.
+- **Directional travel:** bots now hold one random direction for 20-30
+  ticks before picking a new one, instead of jittering every tick. Bumped
+  the per-tick step to 40px (vs. the client's human-key-repeat-bound
+  4px) — a bot has no such constraint, and the whole point was to make
+  chunk crossings the norm within a single run (20 ticks x 40px = 800px,
+  a full chunk width) rather than a rare fluke.
+- **chunkCrossings counter:** each bot integrates its own believed
+  position from the deltas it sends and tracks `worldToChunk` transitions,
+  so the periodic summary reports concrete evidence of how much AOI
+  recalculation the run is actually forcing.
+- **Result (200 bots, ~40s):** all 200 connected and stayed connected;
+  scattered spawn positions verified directly against the DB (not just
+  trusted); 675 chunk crossings over the run (~200 crossings per 5s
+  window from the load-test's own counter). Still **zero** `[WARN] Tick
+  rate dropping` warnings at the real 10ms threshold. Verified this was a
+  real result and not a monitoring gap by rerunning the same 200-bot
+  scale with the threshold forced to 0ms: the slowest single
+  move-handler execution across the whole run — the one dominated by
+  `updateChunkAndVisibility`'s O(200) fan-out — was **5.74ms**, still
+  comfortably under the 10ms budget. `db-flush` for a 200-character dirty
+  batch rose to 85-220ms (vs. ~20-25ms at 50 bots — a real, worth-watching
+  trend as the population grows) but is still under 3% of the 7s flush
+  interval. Data integrity held: exactly 200 `Account` rows after the run.
+- **Conclusion so far:** at 200 concurrently-moving, spatially-scattered
+  players, neither the AOI fan-out nor the write-behind queue is close to
+  the tick budget. The next capacity question — where the ceiling
+  actually is — is still open; 200 was the number asked for, not a
+  discovered limit.
 
 ---
 
@@ -235,14 +269,18 @@ called done — not just typechecked:
   and mouse/keyboard input, with pixel-level and screenshot checks for
   terrain colors, health bars, hit flashes, floating damage numbers, the
   React HUD/chat DOM, and cross-session chat delivery.
-- A 50-bot headless load test (`server/scripts/loadTest.ts`) against a
-  real Postgres instance, with DB write timing captured directly from
-  `console.time`/`console.timeEnd` output rather than estimated.
+- Headless load tests (`server/scripts/loadTest.ts`) against a real
+  Postgres instance at both 50 and 200 bots, with DB write timing and
+  chunk-crossing counts captured directly from script/log output rather
+  than estimated — including a deliberate check that the tick-rate
+  monitor itself actually fires (by forcing its threshold to 0ms) so "zero
+  warnings" could be trusted as a real result rather than a dead check.
 
 ## Not yet started
 
 - Phase 5 remainder: equipment slots, skill trees (event bridge, chat, and
   inventory grid are done).
-- Phase 6 remainder: delta-compression tuning (load testing and write/tick
-  profiling are done; no capacity ceiling has been found yet at 50 bots,
-  so there's no evidence delta-compression is needed yet either).
+- Phase 6 remainder: delta-compression tuning, and finding the actual
+  capacity ceiling (200 concurrently-moving, spatially-scattered bots is
+  still comfortably under budget on both AOI fan-out and DB flush time —
+  200 was the number asked for, not a discovered limit).
