@@ -32,6 +32,11 @@ const INVENTORY_SLOT_COUNT = 20;
  * the room's ability to keep up with incoming messages — worth a warning. */
 const TICK_WARN_THRESHOLD_MS = 10;
 
+/** Past this, the room would struggle to sustain even 20 "ticks" (messages)
+ * per second on a single connection alone — a critical capacity signal,
+ * not just a soft warning. */
+const TICK_CRITICAL_THRESHOLD_MS = 50;
+
 interface MoveMessage {
   x: number;
   y: number;
@@ -91,7 +96,11 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
       const start = performance.now();
       handler(client, message);
       const elapsed = performance.now() - start;
-      if (elapsed > TICK_WARN_THRESHOLD_MS) {
+      if (elapsed > TICK_CRITICAL_THRESHOLD_MS) {
+        console.error(
+          `[CRITICAL] Tick rate death - execution took ${elapsed.toFixed(2)}ms (>${TICK_CRITICAL_THRESHOLD_MS}ms, <20 ticks/sec) handler=${label} clients=${this.clients.length}`,
+        );
+      } else if (elapsed > TICK_WARN_THRESHOLD_MS) {
         console.warn(
           `[WARN] Tick rate dropping - execution took ${elapsed.toFixed(2)}ms (handler=${label}, clients=${this.clients.length})`,
         );

@@ -41,13 +41,25 @@ function pickRunLength(): number {
   return MIN_RUN_TICKS + Math.floor(Math.random() * (MAX_RUN_TICKS - MIN_RUN_TICKS + 1));
 }
 
-function parseBotCount(): number {
-  const arg = process.argv.find((value) => value.startsWith('--bots='));
-  const count = arg ? Number(arg.slice('--bots='.length)) : 10;
+const DEFAULT_INITIAL_BOTS = 200;
+const WAVE_SIZE = 100;
+const WAVE_INTERVAL_MS = 15000;
+const DEFAULT_MAX_BOTS = 5000; // safety cap so a runaway ramp can't exhaust this machine
+
+function parseIntArg(flag: string, fallback: number): number {
+  const arg = process.argv.find((value) => value.startsWith(flag));
+  const count = arg ? Number(arg.slice(flag.length)) : fallback;
   if (!Number.isInteger(count) || count <= 0) {
-    throw new Error(`invalid --bots value: ${arg}`);
+    throw new Error(`invalid ${flag} value: ${arg}`);
   }
   return count;
+}
+
+/** `--bots=N` is kept as an alias for the initial wave size, for anyone
+ * still using the old static-count invocation. */
+function parseInitialBotCount(): number {
+  const legacyBots = process.argv.find((value) => value.startsWith('--bots='));
+  return parseIntArg(legacyBots ? '--bots=' : '--initial-bots=', DEFAULT_INITIAL_BOTS);
 }
 
 async function register(username: string, password: string): Promise<void> {
@@ -149,37 +161,58 @@ async function spawnBot(index: number, stats: BotStats): Promise<() => Promise<v
   };
 }
 
+function logMemoryUsage(context: string, botCount: number): void {
+  const { heapUsed } = process.memoryUsage();
+  console.log(`[load-test] ${context}: totalBots=${botCount} loadTestHeapUsed=${(heapUsed / 1024 / 1024).toFixed(1)}MB`);
+}
+
 async function main() {
-  const botCount = parseBotCount();
-  console.log(`Spawning ${botCount} bots against ${SERVER_HTTP_URL} (ws: ${SERVER_WS_URL})...`);
+  const initialBots = parseInitialBotCount();
+  const maxBots = parseIntArg('--max-bots=', DEFAULT_MAX_BOTS);
+  console.log(`Progressive ramp: ${initialBots} initial bots, +${WAVE_SIZE} every ${WAVE_INTERVAL_MS / 1000}s, capped at ${maxBots}.`);
+  console.log(`Against ${SERVER_HTTP_URL} (ws: ${SERVER_WS_URL}).`);
   console.log(`Scattered spawn across a ${MAP_EXTENT_PX}x${MAP_EXTENT_PX}px map; directional runs of ${MIN_RUN_TICKS}-${MAX_RUN_TICKS} ticks at ${BOT_MOVE_STEP}px/tick.`);
 
-  const stats: BotStats[] = Array.from({ length: botCount }, () => ({
-    connected: false,
-    movesSent: 0,
-    chunkCrossings: 0,
-  }));
+  const stats: BotStats[] = [];
   const cleanups: Array<() => Promise<void>> = [];
-  const spawnPromises: Promise<void>[] = [];
+  let nextIndex = 0;
+  let stopped = false;
 
-  for (let i = 0; i < botCount; i++) {
-    spawnPromises.push(
-      spawnBot(i, stats[i]!)
-        .then((cleanup) => {
-          cleanups.push(cleanup);
-        })
-        .catch((error) => {
-          console.error(`[bot ${i}] failed to connect:`, error instanceof Error ? error.message : error);
-        }),
-    );
-    if (i < botCount - 1) {
-      await new Promise((resolve) => setTimeout(resolve, SPAWN_STAGGER_MS));
+  /** Spawns `count` more bots (staggered), appending to the shared stats/
+   * cleanup arrays, then logs this process's own heap usage — confirming
+   * the load-test harness itself isn't the bottleneck (see index.ts for
+   * the server-side memory log, which is the number that actually answers
+   * whether we're hitting V8 memory limits under this load). */
+  async function spawnWave(count: number): Promise<void> {
+    const spawnPromises: Promise<void>[] = [];
+
+    for (let i = 0; i < count; i++) {
+      const index = nextIndex++;
+      const botStats: BotStats = { connected: false, movesSent: 0, chunkCrossings: 0 };
+      stats.push(botStats);
+
+      spawnPromises.push(
+        spawnBot(index, botStats)
+          .then((cleanup) => {
+            cleanups.push(cleanup);
+          })
+          .catch((error) => {
+            console.error(`[bot ${index}] failed to connect:`, error instanceof Error ? error.message : error);
+          }),
+      );
+
+      if (i < count - 1) {
+        await new Promise((resolve) => setTimeout(resolve, SPAWN_STAGGER_MS));
+      }
     }
+
+    await Promise.all(spawnPromises);
+    logMemoryUsage('wave spawned', stats.length);
   }
 
-  await Promise.all(spawnPromises);
+  await spawnWave(initialBots);
   const connectedCount = stats.filter((s) => s.connected).length;
-  console.log(`${connectedCount}/${botCount} bots connected. Sending 'move' every ${MOVE_INTERVAL_MS}ms each.`);
+  console.log(`${connectedCount}/${stats.length} bots connected. Sending 'move' every ${MOVE_INTERVAL_MS}ms each.`);
   console.log('Press Ctrl+C to stop.');
 
   const summaryInterval = setInterval(() => {
@@ -187,14 +220,32 @@ async function main() {
     const totalMoves = stats.reduce((sum, s) => sum + s.movesSent, 0);
     const totalCrossings = stats.reduce((sum, s) => sum + s.chunkCrossings, 0);
     console.log(
-      `[load-test] connected=${nowConnected}/${botCount} totalMovesSent=${totalMoves} chunkCrossings=${totalCrossings}`,
+      `[load-test] connected=${nowConnected}/${stats.length} totalMovesSent=${totalMoves} chunkCrossings=${totalCrossings}`,
     );
   }, SUMMARY_INTERVAL_MS);
   summaryInterval.unref();
 
+  const rampInterval = setInterval(() => {
+    if (stopped) return;
+    if (stats.length >= maxBots) {
+      console.log(`[load-test] reached --max-bots=${maxBots} safety cap; holding steady (no breaking point found yet).`);
+      clearInterval(rampInterval);
+      return;
+    }
+
+    const waveSize = Math.min(WAVE_SIZE, maxBots - stats.length);
+    console.log(`[load-test] ramping up: spawning ${waveSize} more bots (total will be ${stats.length + waveSize})...`);
+    spawnWave(waveSize).catch((error) => {
+      console.error('[load-test] wave spawn failed:', error);
+    });
+  }, WAVE_INTERVAL_MS);
+  rampInterval.unref();
+
   const shutdown = () => {
     console.log('\nShutting down bots...');
+    stopped = true;
     clearInterval(summaryInterval);
+    clearInterval(rampInterval);
     Promise.all(cleanups.map((cleanup) => cleanup()))
       .finally(() => prisma.$disconnect())
       .finally(() => process.exit(0));

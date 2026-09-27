@@ -1,5 +1,10 @@
 import { prisma } from 'database';
 
+/** Past this, a single flush is eating nearly half the 7s interval between
+ * flushes — a critical capacity signal that Postgres (or the size of the
+ * dirty set) can't keep up, not just a soft warning. */
+const DB_FLUSH_CRITICAL_THRESHOLD_MS = 3000;
+
 interface PendingCharacterState {
   x: number;
   y: number;
@@ -136,7 +141,7 @@ export class StateSyncService {
     // grows (e.g. 50+ characters under load-test load) without ever
     // blocking the room's own message handling — this timer runs on the
     // FIFO writeQueue, never inline with a game-loop tick.
-    console.time(label);
+    const start = performance.now();
     try {
       await prisma.$transaction([
         ...Array.from(characters, ([characterId, { x, y, hp }]) =>
@@ -172,7 +177,13 @@ export class StateSyncService {
       }
       throw error;
     } finally {
-      console.timeEnd(label);
+      const elapsed = performance.now() - start;
+      console.log(`${label}: ${elapsed.toFixed(3)}ms`);
+      if (elapsed > DB_FLUSH_CRITICAL_THRESHOLD_MS) {
+        console.error(
+          `[CRITICAL] Database choke - ${label} took ${elapsed.toFixed(2)}ms (>${DB_FLUSH_CRITICAL_THRESHOLD_MS}ms, nearing the 7s flush interval) characters=${characters.size} inventories=${inventories.size}`,
+        );
+      }
     }
   }
 }
