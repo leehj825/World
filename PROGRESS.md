@@ -254,6 +254,51 @@ the bottom.
   actually is — is still open; 200 was the number asked for, not a
   discovered limit.
 
+### Finding the ceiling: progressive ramp to failure
+
+- `loadTest.ts` now ramps continuously — 200 initial bots, +100 every
+  15s, capped at `--max-bots` (default 5000) as a safety limit — instead
+  of holding at a fixed count. Two new critical thresholds were added
+  where the actual timing lives: `GameRoom` logs `[CRITICAL] Tick rate
+  death` past 50ms per message handler (vs. the existing 10ms warning),
+  and `StateSyncService` logs `[CRITICAL] Database choke` past 3000ms per
+  flush (roughly half the 7s interval). `index.ts` also logs the
+  server's own `heapUsed` every 15s — the number that actually answers
+  "are we hitting V8 memory limits," distinct from the load-test
+  process's own heap (which only rules out the harness itself being the
+  bottleneck, and is logged separately in `loadTest.ts`).
+- **Result:** ran the ramp against a real local Postgres, watching both
+  processes' logs as bot count climbed from 200 toward the cap.
+  - **Tick rate CRITICAL fired 3 times**, first at **824 connected
+    clients** (55.25ms), climbing to 71.88ms at 1031 clients — real,
+    worsening degradation, not a single fluke.
+  - **DB flush never went critical** — max observed was ~832ms against
+    200-800 dirty characters, comfortably under the 3000ms threshold,
+    even while tick rate was already failing.
+  - **Memory was never a factor** — server `heapUsed` fluctuated
+    60-220MB throughout with no monotonic climb (healthy GC, not a leak).
+  - **The actual first-to-break component was neither of the three named
+    categories** — it was the join/matchmaking pipeline. "Seat
+    reservation expired" failures became frequent right around the same
+    1000-1050 client range, and the number of bots that stayed
+    successfully connected plateaued there even as the load test kept
+    trying to ramp toward 1600 (by which point even the plain HTTP
+    register/login calls started failing outright). The likely cause:
+    `onJoin`'s async Prisma lookup can't keep up with the connection
+    rate once the event loop is also busy with ~1000 concurrent `move`
+    handlers each doing O(n) AOI work — a queueing effect, not a crash.
+  - The server process itself **never crashed** and kept answering
+    `/health` with 200 throughout, even after new connections had
+    started failing.
+- **Ceiling: ~1000-1050 concurrent connected players** on this single
+  Node process / single Postgres instance, bottlenecked by connection
+  throughput and tick time together, not by the database or memory. This
+  is a single-process ceiling, not an inherent architectural one — the
+  natural next lever is horizontal scaling (multiple Colyseus room
+  processes / Colyseus's built-in horizontal scaling presence system),
+  which is out of scope for this pass but is exactly what this number
+  would inform.
+
 ---
 
 ## Verification approach
@@ -280,7 +325,8 @@ called done — not just typechecked:
 
 - Phase 5 remainder: equipment slots, skill trees (event bridge, chat, and
   inventory grid are done).
-- Phase 6 remainder: delta-compression tuning, and finding the actual
-  capacity ceiling (200 concurrently-moving, spatially-scattered bots is
-  still comfortably under budget on both AOI fan-out and DB flush time —
-  200 was the number asked for, not a discovered limit).
+- Phase 6 remainder: delta-compression tuning (the discovered ceiling is a
+  connection-throughput/tick-time problem on a single process, not a
+  wire-size problem, so delta compression wouldn't be the first lever to
+  pull), and horizontal scaling to push past the ~1000-1050 concurrent
+  connection ceiling found by the progressive ramp test.
