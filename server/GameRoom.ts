@@ -2,7 +2,6 @@ import { Room } from 'colyseus';
 import type { Client } from 'colyseus';
 import { StateView } from '@colyseus/schema';
 import jwt from 'jsonwebtoken';
-import { prisma } from 'database';
 import {
   AttackMessage,
   ChatInput,
@@ -15,6 +14,7 @@ import {
   Player,
   worldToChunk,
 } from 'shared';
+import { isSessionTokenPayload, type SessionTokenPayload } from './session.js';
 import { StateSyncService } from './StateSyncService.js';
 
 const jwtSecretEnv = process.env.JWT_SECRET;
@@ -46,9 +46,7 @@ interface AuthOptions {
   token?: string;
 }
 
-interface AuthResult {
-  accountId: string;
-}
+type AuthResult = SessionTokenPayload;
 
 interface ChunkCoords {
   chunkX: number;
@@ -129,6 +127,13 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
     this.broadcast('chat_message', { sender, text } satisfies ChatMessage);
   }
 
+  /**
+   * Verifies the JWT and nothing else — no database lookup here. The token
+   * already carries the full spawn snapshot (see session.ts for why), so
+   * onAuth/onJoin together are pure signature verification + in-memory
+   * construction, with no I/O in Colyseus's latency-sensitive seat
+   * reservation window.
+   */
   onAuth(_client: GameClient, options: AuthOptions): AuthResult {
     if (!options.token) {
       throw new Error('missing auth token');
@@ -136,42 +141,36 @@ export class GameRoom extends Room<{ state: GameState; client: GameClient }> {
 
     try {
       const payload = jwt.verify(options.token, JWT_SECRET);
-      if (typeof payload === 'string' || typeof payload.accountId !== 'string') {
+      if (!isSessionTokenPayload(payload)) {
         throw new Error('malformed auth token');
       }
-      return { accountId: payload.accountId };
+      return payload;
     } catch {
       throw new Error('invalid auth token');
     }
   }
 
-  async onJoin(client: GameClient) {
+  onJoin(client: GameClient) {
     if (!client.auth) {
       throw new Error('missing auth data');
     }
 
-    const character = await prisma.character.findFirst({
-      where: { accountId: client.auth.accountId },
-      include: { inventoryItems: true },
-    });
-    if (!character) {
-      throw new Error('no character found for this account');
-    }
+    const { characterId, characterName, attackPower, x, y, hp, maxHp, inventory } = client.auth;
 
-    this.characterIds.set(client.sessionId, character.id);
-    this.characterNames.set(client.sessionId, character.name);
-    this.attackPowers.set(client.sessionId, character.attackPower);
+    this.characterIds.set(client.sessionId, characterId);
+    this.characterNames.set(client.sessionId, characterName);
+    this.attackPowers.set(client.sessionId, attackPower);
 
     const player = new Player();
-    player.x = character.x;
-    player.y = character.y;
-    player.hp = character.hp;
-    player.maxHp = character.maxHp;
-    for (const row of character.inventoryItems) {
+    player.x = x;
+    player.y = y;
+    player.hp = hp;
+    player.maxHp = maxHp;
+    for (const slot of inventory) {
       const item = new InventoryItem();
-      item.itemId = row.itemId;
-      item.quantity = row.quantity;
-      player.inventory.set(String(row.slotIndex), item);
+      item.itemId = slot.itemId;
+      item.quantity = slot.quantity;
+      player.inventory.set(String(slot.slotIndex), item);
     }
     this.state.players.set(client.sessionId, player);
 

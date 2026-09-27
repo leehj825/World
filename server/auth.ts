@@ -2,6 +2,7 @@ import { Router } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { prisma } from 'database';
+import type { SessionTokenPayload } from './session.js';
 
 const jwtSecretEnv = process.env.JWT_SECRET;
 if (!jwtSecretEnv) {
@@ -27,6 +28,8 @@ authRouter.post('/register', async (req, res) => {
     return;
   }
 
+  // bcrypt.hash without a callback returns a Promise and runs on libuv's
+  // threadpool, not the JS main thread — this was already non-blocking.
   const passwordHash = await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
 
   const account = await prisma.account.create({
@@ -57,7 +60,13 @@ authRouter.post('/login', async (req, res) => {
     return;
   }
 
-  const account = await prisma.account.findUnique({ where: { username } });
+  // One query, same as before — now also pulling the character + inventory
+  // GameRoom.onJoin used to look up separately, so the room never has to
+  // touch the database during its own (latency-sensitive) join sequence.
+  const account = await prisma.account.findUnique({
+    where: { username },
+    include: { characters: { include: { inventoryItems: true } } },
+  });
   if (!account) {
     res.status(401).json({ error: 'invalid credentials' });
     return;
@@ -69,7 +78,29 @@ authRouter.post('/login', async (req, res) => {
     return;
   }
 
-  const token = jwt.sign({ accountId: account.id }, JWT_SECRET, { expiresIn: '7d' });
+  const character = account.characters[0];
+  if (!character) {
+    res.status(500).json({ error: 'account has no character' });
+    return;
+  }
+
+  const payload: SessionTokenPayload = {
+    accountId: account.id,
+    characterId: character.id,
+    characterName: character.name,
+    x: character.x,
+    y: character.y,
+    hp: character.hp,
+    maxHp: character.maxHp,
+    attackPower: character.attackPower,
+    inventory: character.inventoryItems.map((item) => ({
+      slotIndex: item.slotIndex,
+      itemId: item.itemId,
+      quantity: item.quantity,
+    })),
+  };
+
+  const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
 
   res.json({ token });
 });
